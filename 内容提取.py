@@ -137,6 +137,144 @@ def is_table_like_line(line):
         if gap > 8:
             big_gap_count += 1
     return big_gap_count >= 1
+
+def get_default_margins(lines):
+    left_keys = []
+    right_keys = []
+
+    for line in lines:
+        if not line["text"].strip():
+            continue
+
+        left_keys.append(round(line["x0"] / 10) * 10)
+        right_keys.append(round((line["page_width"] - line["x1"]) / 10) * 10)
+
+    default_left = max(set(left_keys), key=left_keys.count) if left_keys else 0
+    default_right = max(set(right_keys), key=right_keys.count) if right_keys else 0
+
+    return default_left, default_right
+
+
+def is_layout_special_line(line, default_left, default_right, gap_threshold=18):
+    words = line.get("words", [])
+
+    if len(words) < 2:
+        return False
+
+    words = sorted(words, key=lambda w: w["x0"])
+
+    left_blank = round(line["x0"] / 10) * 10
+    right_blank = round((line["page_width"] - line["x1"]) / 10) * 10
+
+    left_normal = abs(left_blank - default_left) <= 30
+    right_normal = abs(right_blank - default_right) <= 30
+
+    left_abnormal = not left_normal
+    right_abnormal = not right_normal
+
+    has_left_content = False
+    has_right_content = False
+
+    for i in range(1, len(words)):
+        gap = words[i]["x0"] - words[i - 1]["x1"]
+
+        if gap > gap_threshold:
+            has_left_content = True
+            has_right_content = True
+            break
+
+    if not (has_left_content and has_right_content):
+        return False
+
+    if left_normal and right_abnormal:
+        return True
+
+    if left_abnormal and right_normal:
+        return True
+
+    if left_abnormal and right_abnormal:
+        return True
+
+    return False
+def get_table_areas(page, min_length=25, merge_gap=20):
+    lines = []
+
+    for d in page.get_drawings():
+        for item in d.get("items", []):
+            if item[0] != "l":
+                continue
+            p1 = item[1]
+            p2 = item[2]
+            x0, y0 = p1.x, p1.y
+            x1, y1 = p2.x, p2.y
+            length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+            if length < min_length:
+                continue
+            is_horizontal = abs(y1 - y0) <= 2
+            is_vertical = abs(x1 - x0) <= 2
+            if not (is_horizontal or is_vertical):
+                continue
+            rect = fitz.Rect(
+                min(x0, x1) - 2,
+                min(y0, y1) - 2,
+                max(x0, x1) + 2,
+                max(y0, y1) + 2
+            )
+            lines.append({
+                "rect": rect,
+                "type": "h" if is_horizontal else "v"
+            })
+    areas = []
+    for line in lines:
+        rect = line["rect"]
+        added = False
+        for area in areas:
+            expanded = fitz.Rect(
+                area["rect"].x0 - merge_gap,
+                area["rect"].y0 - merge_gap,
+                area["rect"].x1 + merge_gap,
+                area["rect"].y1 + merge_gap
+            )
+            if expanded.intersects(rect):
+                area["rect"].x0 = min(area["rect"].x0, rect.x0)
+                area["rect"].y0 = min(area["rect"].y0, rect.y0)
+                area["rect"].x1 = max(area["rect"].x1, rect.x1)
+                area["rect"].y1 = max(area["rect"].y1, rect.y1)
+                area["types"].append(line["type"])
+                added = True
+                break
+        if not added:
+            areas.append({
+                "rect": fitz.Rect(rect),
+                "types": [line["type"]]
+            })
+    table_areas = []
+    for area in areas:
+        h_count = area["types"].count("h")
+        v_count = area["types"].count("v")
+        if h_count >= 2 and v_count >= 2:
+            r = area["rect"]
+            table_areas.append(
+                fitz.Rect(
+                    max(0, r.x0 - 10),
+                    max(0, r.y0 - 10),
+                    min(page.rect.width, r.x1 + 10),
+                    min(page.rect.height, r.y1 + 10)
+                )
+            )
+
+    return table_areas
+def get_table_area_for_line(line, table_areas):
+    line_rect = fitz.Rect(
+        line["x0"],
+        line["y"],
+        line["x1"],
+        line.get("y1", line["y"] + 5)
+    )
+    for area in table_areas:
+        if area.intersects(line_rect):
+            return area
+    return None
 def merge_lines(lines):
     paragraphs = []
     current_paragraph = ""
@@ -235,28 +373,78 @@ def line_in_block(line, block):
         line["x1"],
         line.get("y1", line["y"] + 5)
     )
-    return rect_overlap_ratio(line_rect, block["clip"]) > 0
+    return rect_overlap_ratio(line_rect, block["clip"]) > 0.02
 def save_docx_in_order(lines, output_path, pdf_path):
     docx_file = Document()
+
     style = docx_file.styles["Normal"]
     style.font.name = "宋体"
     style._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
     style.font.size = Pt(11)
+
     pdf_doc = fitz.open(pdf_path)
+
+    page_table_areas = {}
+    for page in pdf_doc:
+        page_table_areas[page.number] = get_table_areas(page)
+
+    default_left, default_right = get_default_margins(lines)
+
     blocks = []
+    used_table_clips = []
+
     i = 0
+
     while i < len(lines):
         line = lines[i]
-        if is_table_like_line(line):
+        page_index = line["page_index"]
+
+        table_area = get_table_area_for_line(
+            line,
+            page_table_areas.get(page_index, [])
+        )
+
+        if table_area:
+            duplicated = False
+
+            for used in used_table_clips:
+                if used["page_index"] == page_index and used["clip"].intersects(table_area):
+                    duplicated = True
+                    break
+
+            if not duplicated:
+                blocks.append({
+                    "page_index": page_index,
+                    "start_index": i,
+                    "end_index": i + 1,
+                    "clip": table_area
+                })
+
+                used_table_clips.append({
+                    "page_index": page_index,
+                    "clip": table_area
+                })
+            i += 1
+            continue
+        if is_table_like_line(line) or is_layout_special_line(line, default_left, default_right):
             table_lines = [line]
-            page_index = line["page_index"]
             last_y = line["y"]
             j = i + 1
             while j < len(lines):
                 next_line = lines[j]
                 if next_line.get("page_index") != page_index:
                     break
-                if abs(next_line["y"] - last_y) <= 28:
+                y_close = abs(next_line["y"] - last_y) <= 28
+                next_table_area = get_table_area_for_line(
+                    next_line,
+                    page_table_areas.get(page_index, [])
+                )
+                same_kind = (
+                    next_table_area
+                    or is_table_like_line(next_line)
+                    or is_layout_special_line(next_line, default_left, default_right)
+                )
+                if y_close and same_kind:
                     table_lines.append(next_line)
                     last_y = next_line["y"]
                     j += 1
@@ -273,6 +461,25 @@ def save_docx_in_order(lines, output_path, pdf_path):
             i = j
         else:
             i += 1
+    merged_blocks = []
+    for block in blocks:
+        if not merged_blocks:
+            merged_blocks.append(block)
+            continue
+        last = merged_blocks[-1]
+        same_page = block["page_index"] == last["page_index"]
+        vertical_gap = block["clip"].y0 - last["clip"].y1
+        if same_page and vertical_gap <= 25:
+            last["end_index"] = max(last["end_index"], block["end_index"])
+            last["clip"] = fitz.Rect(
+                min(last["clip"].x0, block["clip"].x0),
+                min(last["clip"].y0, block["clip"].y0),
+                max(last["clip"].x1, block["clip"].x1),
+                max(last["clip"].y1, block["clip"].y1)
+            )
+        else:
+            merged_blocks.append(block)
+    blocks = merged_blocks
     pdf_doc.close()
     text_buffer = []
     i = 0
