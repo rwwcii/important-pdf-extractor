@@ -20,10 +20,10 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --clean --onefile 文件提取.py
+          pyinstaller --clean --onefile 内容提取.py
 
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
-          name: 文件提取-windows
+          name: 内容提取-windows
           path: dist/*
